@@ -34,7 +34,7 @@ jobs:
           robot --outputdir results tests
 
       - name: Upload Robot Results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v6
         with:
           name: robot-results
           path: results
