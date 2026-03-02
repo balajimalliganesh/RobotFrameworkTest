@@ -1,0 +1,179 @@
+name: Robot Framework (Playwright)
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "Robot tags to include (e.g. smokeANDcritical)"
+        required: false
+        default: ""
+      skipTags:
+        description: "Robot tags to exclude (e.g. not_slow)"
+        required: false
+        default: ""
+      tests:
+        description: "Specific test/suite to run (path or pattern)"
+        required: false
+        default: ""
+
+# Cancel older runs on the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  # Set ROBOT_BROWSER_HEADED=true via workflow_dispatch if you want to debug locally.
+  ROBOT_BROWSER_HEADED: "false"
+  # Default path where robotframework-browser stores videos/screenshots on failure
+  RFBROWSER_LOGLEVEL: "DEBUG"
+
+jobs:
+  test:
+    name: Robot on ${{ matrix.os }} / Py ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest, macos-latest ]
+        python: [ "3.10", "3.11", "3.12" ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Optional: cache pip to speed up installs
+      - name: Set up pip cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: "pip"
+
+      - name: Set up Node.js (for Playwright)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Install Python deps
+      # Prefer a requirements file if present; fallback to minimal libs
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+          else
+            python -m pip install --upgrade pip
+            pip install robotframework robotframework-browser robotframework-robocop robotframework-jsonlibrary
+          fi
+
+      # Initialize robotframework-browser (downloads Playwright driver/browsers and ties to node)
+      - name: Install Playwright browsers via robotframework-browser
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # rfbrowser init handles the Playwright CLI + browsers
+          rfbrowser init
+
+      # Linux requires additional system deps for browsers;
+      # rfbrowser init / playwright install --with-deps handles this,
+      # but this step is a safe fallback for Ubuntu images if you face missing libs.
+      - name: (Linux only) Install system deps (fallback)
+        if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        run: |
+          set -euxo pipefail
+          npx playwright install --with-deps
+
+      # Optional: lint Robot files (you can disable this step)
+      - name: Lint .robot with Robocop
+        shell: bash
+        continue-on-error: true
+        run: |
+          if command -v robocop >/dev/null 2>&1; then
+            robocop -r sarif -o robocop.sarif .
+          fi
+      - name: Upload Robocop report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: robocop-${{ matrix.os }}-${{ matrix.python }}
+          path: robocop.sarif
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # On Linux, wrap GUI runs with xvfb even though we do headless by default (handy for debugging)
+      - name: Run Robot tests
+        shell: bash
+        env:
+          # You can point this to your tests root if different
+          ROBOT_TESTS_PATH: tests
+          # Surface tags from dispatch inputs
+          INPUT_TAGS: ${{ github.event.inputs.tags }}
+          INPUT_SKIP_TAGS: ${{ github.event.inputs.skipTags }}
+          INPUT_TESTS: ${{ github.event.inputs.tests }}
+        run: |
+          set -euxo pipefail
+
+          # Construct tag/include/exclude args
+          INCLUDE_ARG=""
+          EXCLUDE_ARG=""
+          if [ -n "${INPUT_TAGS:-}" ]; then
+            INCLUDE_ARG="--include ${INPUT_TAGS}"
+          fi
+          if [ -n "${INPUT_SKIP_TAGS:-}" ]; then
+            EXCLUDE_ARG="--exclude ${INPUT_SKIP_TAGS}"
+          fi
+
+          # Pick target: either specific tests from input or default path
+          TARGET="${INPUT_TESTS:-$ROBOT_TESTS_PATH}"
+
+          # Ensure output dir exists
+          OUTDIR="reports"
+          mkdir -p "$OUTDIR"
+
+          # Headless by default; override with env if needed
+          export HEADLESS=${ROBOT_BROWSER_HEADED:-false}
+          export RFBROWSER_HEADLESS=$([ "$HEADLESS" = "true" ] && echo "0" || echo "1")
+
+          # For Linux, use xvfb-run to emulate display if headed is true
+          if [[ "$RUNNER_OS" == "Linux" && "$HEADLESS" == "true" ]]; then
+            xvfb-run -a -s "-screen 0 1920x1080x24" \
+              robot --outputdir "$OUTDIR" $INCLUDE_ARG $EXCLUDE_ARG -x xunit.xml "$TARGET"
+          else
+            robot --outputdir "$OUTDIR" $INCLUDE_ARG $EXCLUDE_ARG -x xunit.xml "$TARGET"
+          fi
+
+      # Always upload Robot logs & media
+      - name: Upload Robot artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: robot-reports-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            reports/**
+            **/browser/**/video/**
+            **/browser/**/screenshots/**
+          retention-days: 14
+
+      # Surface results in PRs
+      - name: Publish test summary
+        if: always()
+        uses: test-summary/action@v2
+        with:
+          paths: reports/xunit.xml
